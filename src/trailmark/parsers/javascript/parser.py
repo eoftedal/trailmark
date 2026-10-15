@@ -10,6 +10,7 @@ from tree_sitter_language_pack import get_language
 from trailmark.models.edges import CodeEdge, EdgeConfidence, EdgeKind
 from trailmark.models.graph import CodeGraph
 from trailmark.models.nodes import (
+    Attribute,
     BranchInfo,
     CodeUnit,
     NodeKind,
@@ -26,6 +27,7 @@ from trailmark.parsers._common import (
     node_text,
     parse_directory,
 )
+from trailmark.parsers._js_toplevel import extract_top_level_code
 
 _BRANCH_NODE_TYPES = frozenset(
     {
@@ -66,6 +68,7 @@ class JavaScriptParser:
         graph = CodeGraph(language="javascript", root_path=file_path)
         module_id = module_id_from_path(file_path)
         _visit_module(tree.root_node, file_path, module_id, graph)
+        _extract_top_level(tree.root_node, file_path, module_id, graph)
         return graph
 
     def parse_directory(self, dir_path: str) -> CodeGraph:
@@ -255,6 +258,58 @@ def _extract_function_expr(
         file_path,
         graph,
     )
+
+
+def _extract_top_level(
+    root: Node,
+    file_path: str,
+    module_id: str,
+    graph: CodeGraph,
+) -> None:
+    """Extract anonymous callbacks and calls made by top-level statements."""
+
+    def add_callback(
+        func_node: Node,
+        func_id: str,
+        name: str,
+        attributes: tuple[Attribute, ...],
+    ) -> None:
+        # Expression-bodied arrows (``x => x.go()``) have no block; collect
+        # from the function itself so the body expression is included.
+        body = func_node.child_by_field_name("body")
+        collect_from = body if body is not None and body.type == "statement_block" else func_node
+        branches: list[BranchInfo] = []
+        exception_types: list[TypeRef] = []
+        calls: list[tuple[str, Node]] = []
+        collect_body_info(
+            collect_from,
+            file_path,
+            _BRANCH_NODE_TYPES,
+            "call_expression",
+            _THROW_TYPES,
+            branches,
+            exception_types,
+            calls,
+        )
+        graph.nodes[func_id] = CodeUnit(
+            id=func_id,
+            name=name,
+            kind=NodeKind.FUNCTION,
+            location=make_location(func_node, file_path),
+            parameters=tuple(_extract_parameters(func_node)),
+            cyclomatic_complexity=compute_complexity(branches),
+            branches=tuple(branches),
+            exception_types=tuple(exception_types),
+            docstring=_extract_jsdoc(func_node),
+            attributes=attributes,
+        )
+        add_contains_edge(graph, module_id, func_id)
+        _add_call_edges(calls, func_id, module_id, None, file_path, graph)
+
+    def add_module_calls(calls: list[tuple[str, Node]]) -> None:
+        _add_call_edges(calls, module_id, module_id, None, file_path, graph)
+
+    extract_top_level_code(root, module_id, graph, add_callback, add_module_calls)
 
 
 def _extract_class(

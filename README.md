@@ -43,8 +43,8 @@ A language-specific parser walks the directory, parses each file into a tree-sit
 | Language | Extensions | Key constructs |
 | --- | --- | --- |
 | Python | `.py` | functions, classes, methods |
-| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` | functions, classes, arrow functions |
-| TypeScript | `.ts`, `.tsx` | functions, classes, interfaces, enums |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` | functions, classes, arrow functions, top-level callbacks |
+| TypeScript | `.ts`, `.tsx` | functions, classes, interfaces, enums, top-level callbacks |
 | PHP | `.php` | functions, classes, interfaces, traits |
 | Ruby | `.rb` | methods, classes, modules |
 | C | `.c`, `.h` | functions, structs, enums |
@@ -202,6 +202,8 @@ classDiagram
 **Edge kinds:** `calls`, `inherits`, `implements`, `contains`, `imports`, `resolves_to`, `type_uses`, `specializes`, `corresponds_to`
 
 **Edge confidence:** `certain`, `inferred`, `uncertain`
+
+In JavaScript and TypeScript, anonymous functions inside top-level statements (such as route handlers passed to `app.get(...)`) are named after their context and line, e.g. `server:app.get@6` (an anonymous `export default` function is `module:default`), and calls made directly by top-level statements are edges from the module node.
 
 Unresolved calls are materialized as proxy nodes such as
 `proxy.unresolved:<raw-symbol>` so traversal results can show where source
