@@ -8,6 +8,7 @@ from pathlib import Path
 
 from trailmark.analysis.links import apply_repository_links
 from trailmark.analysis.proxies import ensure_proxy_nodes
+from trailmark.analysis.receivers import resolve_receiver_types
 from trailmark.models.graph import CodeGraph
 from trailmark.parsers._common import should_skip_dir
 from trailmark.parsers.base import LanguageParser
@@ -105,7 +106,9 @@ def parse_file(path: str, language: str | None = None) -> CodeGraph:
     """
     file_path = Path(path)
     resolved_language = _resolve_file_language(file_path, language)
-    return ensure_proxy_nodes(_get_parser(resolved_language).parse_file(str(file_path)))
+    graph = _get_parser(resolved_language).parse_file(str(file_path))
+    resolve_receiver_types(graph)
+    return ensure_proxy_nodes(graph)
 
 
 def parse_directory(path: str, language: str = "python") -> CodeGraph:

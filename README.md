@@ -99,7 +99,7 @@ flowchart TD
     class CG data
 ```
 
-Node IDs follow the scheme `module:function`, `module:Class`, or `module:Class.method` for unambiguous lookup. Directory parsing resolves bare cross-file calls when a unique definition exists; ambiguous cross-file calls are left at their original best-effort target and marked `uncertain`. Edge confidence is tagged as `certain` (direct calls, `self.method()`), `inferred` (attribute access on non-self objects), or `uncertain` (dynamic dispatch or ambiguous resolution).
+Node IDs follow the scheme `module:function`, `module:Class`, or `module:Class.method` for unambiguous lookup. Directory parsing resolves bare cross-file calls when a unique definition exists; ambiguous cross-file calls are left at their original best-effort target and marked `uncertain`. Java method calls on a receiver whose declared type can be inferred (locals, parameters, fields, `this`/`super`, `new T().m()`, static `T.m()` and `Outer.Inner.m()`) are linked to the method on that type or its nearest supertype; such edges carry `receiver_type`, `resolved_by = receiver_type`, and the original call text as `raw_target`. Edge confidence is tagged as `certain` (direct calls, `self.method()`), `inferred` (attribute access on non-self objects), or `uncertain` (dynamic dispatch or ambiguous resolution).
 
 ### 2. Index
 
@@ -447,6 +447,10 @@ is a stable public configuration interface.
   `new ConcreteClass()`. Interface dispatch through manifests, computed property
   names, dependency-injection containers, and other dynamic mechanisms remains
   best-effort.
+- Java receiver-type resolution is syntactic. It does not follow method return
+  types (`a.b().c()`), casts, untyped lambda parameters, or supertypes written
+  with type arguments or package qualifiers (`extends Base<T>`), and it leaves a
+  call unresolved when its type name matches types in several unrelated packages.
 - SQL support is PostgreSQL-oriented and extracts schemas, tables, views,
   functions, procedures, and routine/view dependencies. It is not a complete
   SQL dialect validator or query-semantic analyzer.

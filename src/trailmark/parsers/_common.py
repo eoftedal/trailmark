@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from trailmark.analysis.proxies import ensure_proxy_nodes
+from trailmark.analysis.receivers import resolve_receiver_types
 from trailmark.models.edges import CodeEdge, EdgeConfidence, EdgeKind
 from trailmark.models.graph import CodeGraph
 from trailmark.models.nodes import (
@@ -153,6 +154,7 @@ def parse_directory(
     finally:
         _DIRECTORY_PARSE_ROOT.reset(token)
     _link_cross_file_calls(merged)
+    resolve_receiver_types(merged)
     return ensure_proxy_nodes(merged)
 
 

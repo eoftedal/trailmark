@@ -245,6 +245,10 @@ class TestParseOnlyAPI:
         assert "Directory parsing resolves bare cross-file calls" in readme_text
         assert "ambiguous cross-file calls" in readme_text
 
+    def test_readme_documents_java_receiver_type_resolution(self, readme_text: str) -> None:
+        assert "`resolved_by = receiver_type`" in readme_text
+        assert "Java receiver-type resolution is syntactic" in readme_text
+
 
 def _read_requires_python(pyproject_data: dict[str, object]) -> str:
     project_raw = pyproject_data.get("project")

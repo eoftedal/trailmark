@@ -7,6 +7,7 @@ from pathlib import Path
 from tree_sitter import Node, Parser
 from tree_sitter_language_pack import get_language
 
+from trailmark.analysis.receivers import RECEIVER_TYPE_ATTR
 from trailmark.models.edges import CodeEdge, EdgeConfidence, EdgeKind
 from trailmark.models.graph import CodeGraph
 from trailmark.models.nodes import (
@@ -28,6 +29,7 @@ from trailmark.parsers._common import (
     node_text,
     parse_directory,
 )
+from trailmark.parsers.java.receivers import java_receiver_type
 
 _BRANCH_NODE_TYPES = frozenset(
     {
@@ -498,8 +500,17 @@ def _add_call_edges(
                 kind=EdgeKind.CALLS,
                 confidence=confidence,
                 location=make_location(call_node, file_path),
+                attributes=_receiver_attributes(call_node),
             )
         )
+
+
+def _receiver_attributes(call_node: Node) -> tuple[Attribute, ...]:
+    """Record the inferred receiver type for receiver-type call resolution."""
+    receiver_type = java_receiver_type(call_node)
+    if receiver_type is None:
+        return ()
+    return ((RECEIVER_TYPE_ATTR, receiver_type),)
 
 
 def _extract_parameters(node: Node) -> list[Parameter]:
