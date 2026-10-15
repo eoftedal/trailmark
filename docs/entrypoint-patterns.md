@@ -197,6 +197,7 @@ app.post("/login", (req, res) => { ... });
 - **Kind:** `api` · **Trust:** `untrusted_external` · **Asset:** `high`
 - **Pattern:** `\b([A-Za-z_$][\w$]*)\.(get|post|put|patch|delete|all|use|options|head)\s*\(\s*["'`]` — but this shadows many libraries; narrow by import or a recent `express()` call on the receiver.
 - **Gotcha:** `app` can be any name (`router`, `r`, `srv`, etc.); fully robust detection requires type flow or at least tracking which identifiers were assigned from `express()`/`Router()`.
+- **Implemented:** the JS/TS parsers turn function expressions in top-level statements into function nodes named after the callee and line (`server:app.post@2`) with `callback_of`, `route`, and `registered_on_factory` attributes. A callback passed to `get/post/put/patch/delete/all/use/options/head` on a receiver assigned from `express()`, `express.Router()`, or `Router()` (or the CommonJS `require('express')()` / `require('express').Router()`) at module top level is tagged with the description `Express route POST /login` (or `Express middleware` for `use`). Named handler references (`app.get("/x", handler)`) and routes registered inside functions are not detected.
 - **Source:** <https://expressjs.com/en/guide/routing.html>
 
 ### Koa
@@ -211,6 +212,7 @@ router.get("/users", async ctx => { ... });
 - **Scope:** function
 - **Kind:** `api` · **Trust:** `untrusted_external` · **Asset:** `high`
 - **Pattern:** same as Express shape; disambiguate by `koa` / `@koa/router` import.
+- **Gotcha:** the Express detector does not cover this: it keys on receivers assigned from a factory call, and `new Router()` is a constructor call.
 - **Source:** <https://koajs.com/>
 
 ### Fastify
@@ -224,6 +226,7 @@ fastify.get("/ping", async (request, reply) => "pong");
 - **Scope:** function
 - **Kind:** `api` · **Trust:** `untrusted_external` · **Asset:** `high`
 - **Pattern:** same shape as Express; disambiguate by import.
+- **Implemented:** same mechanism as Express, for receivers assigned from `fastify()` / `Fastify()` / `require('fastify')(...)` (`Fastify route GET /ping`). The `fastify.route({ method, url, handler })` form and routes registered inside plugin functions are not detected.
 - **Source:** <https://fastify.dev/docs/latest/Reference/Routes/>
 
 ### Next.js (Pages API)

@@ -340,7 +340,7 @@ Framework coverage:
 | Language | Frameworks detected |
 | --- | --- |
 | Python | Flask, FastAPI, aiohttp, Click, Typer, Celery |
-| JavaScript / TypeScript | NestJS, Next.js (App Router + Pages API), AWS Lambda |
+| JavaScript / TypeScript | NestJS, Next.js (App Router + Pages API), AWS Lambda, Express and Fastify route callbacks |
 | Java | Spring MVC / WebFlux, JAX-RS, Kafka listeners, servlets |
 | C# | ASP.NET Core, Azure Functions |
 | PHP | Symfony `#[Route]` attributes + legacy annotations |
@@ -402,7 +402,7 @@ trust = "untrusted_external"
 
 Later entries override earlier ones when two rules tag the same node, so place broad rules first and specific corrections after.
 
-See [docs/entrypoint-patterns.md](docs/entrypoint-patterns.md) for the full reference, including frameworks not yet implemented (Express / Koa / Fastify, Laravel, Cobra, axum, warp, clap, and others) with grep-ready patterns contributors can use to add new detectors.
+See [docs/entrypoint-patterns.md](docs/entrypoint-patterns.md) for the full reference, including frameworks not yet implemented (Koa, Laravel, Cobra, axum, warp, clap, and others) with grep-ready patterns contributors can use to add new detectors.
 
 Solidity detection uses parser metadata rather than signature regexes. Interface
 declarations are excluded, and derived overrides annotate matching base
@@ -445,6 +445,12 @@ is a stable public configuration interface.
 - `entrypoint_paths_to()` reports call-graph reachability, not attacker-controlled
   data flow. Use preanalysis taint results as a coarse separate signal; Trailmark
   does not yet perform interprocedural taint analysis.
+- Express and Fastify routes are detected only for inline callbacks registered
+  at module top level on a receiver assigned from `express()`,
+  `express.Router()`, `Router()`, or `fastify()` (including the CommonJS forms
+  `require('express')()` and `require('express').Router()`). Handlers passed by
+  name, routes registered inside functions, and `fastify.route({...})` are not
+  tagged; add them to `.trailmark/entrypoints.toml`.
 - TypeScript resolves direct calls and straightforward receivers assigned with
   `new ConcreteClass()`. Interface dispatch through manifests, computed property
   names, dependency-injection containers, and other dynamic mechanisms remains

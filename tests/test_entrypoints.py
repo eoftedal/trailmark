@@ -553,6 +553,105 @@ class TestJavaScriptFrameworks:
         assert any("Next.js App Router" in d for d in descriptions), surface
 
 
+_EXPRESS_SERVER = """\
+import express from 'express'
+
+const app = express()
+const router = express.Router()
+const cache = makeCache()
+
+app.get('/product/:id', (req, res) => {
+  return res.send(lookup(req.params.id))
+})
+router.post('/login', async function (req, res) { audit(req) })
+app.use((req, res, next) => next())
+cache.get('/not-a-route', (v) => v.trim())
+app.listen(3000)
+"""
+
+_FASTIFY_SERVER = """\
+import Fastify from 'fastify'
+const server = Fastify()
+server.post('/items', async (request) => { return save(request.body) })
+"""
+
+
+def _route_surface(tmp_path: Path, language: str) -> dict[str, str | None]:
+    engine = QueryEngine.from_directory(str(tmp_path), language=language)
+    return {ep["node_id"]: ep["description"] for ep in engine.attack_surface()}
+
+
+class TestExpressFastifyRoutes:
+    @pytest.mark.parametrize(("language", "ext"), [("javascript", "js"), ("typescript", "ts")])
+    def test_route_callbacks_detected(self, tmp_path: Path, language: str, ext: str) -> None:
+        (tmp_path / f"server.{ext}").write_text(_EXPRESS_SERVER)
+        (tmp_path / f"f.{ext}").write_text(_FASTIFY_SERVER)
+        assert _route_surface(tmp_path, language) == {
+            "server:app.get@7": "Express route GET /product/:id",
+            "server:router.post@10": "Express route POST /login",
+            "server:app.use@11": "Express middleware",
+            "f:server.post@3": "Fastify route POST /items",
+        }
+
+    def test_route_tag_classification(self, tmp_path: Path) -> None:
+        (tmp_path / "server.ts").write_text(_EXPRESS_SERVER)
+        engine = QueryEngine.from_directory(str(tmp_path), language="typescript")
+        route = next(ep for ep in engine.attack_surface() if ep["node_id"] == "server:app.get@7")
+        assert route["kind"] == "api"
+        assert route["trust_level"] == "untrusted_external"
+        assert route["asset_value"] == "high"
+        assert route["attributes"]["route"] == "/product/:id"
+
+    def test_router_factory_and_template_route(self, tmp_path: Path) -> None:
+        (tmp_path / "r.js").write_text(
+            "const { Router } = require('express')\n"
+            "const r = Router()\n"
+            "r.delete(`/items/:id`, (req, res) => res.end())\n"
+            "r.use('/admin', (req, res, next) => next())\n",
+        )
+        assert _route_surface(tmp_path, "javascript") == {
+            "r:r.delete@3": "Express route DELETE /items/:id",
+            "r:r.use@4": "Express middleware /admin",
+        }
+
+    def test_commonjs_factories_detected(self, tmp_path: Path) -> None:
+        (tmp_path / "server.js").write_text(
+            "const app = require('express')()\n"
+            "const router = require('express').Router()\n"
+            "const fastify = require('fastify')({ logger: true })\n"
+            "app.get('/a', (req, res) => res.end())\n"
+            "router.post('/b', (req, res) => res.end())\n"
+            "fastify.put('/c', async (request) => request.body)\n",
+        )
+        assert _route_surface(tmp_path, "javascript") == {
+            "server:app.get@4": "Express route GET /a",
+            "server:router.post@5": "Express route POST /b",
+            "server:fastify.put@6": "Fastify route PUT /c",
+        }
+
+    def test_anonymous_default_export_in_pages_api(self, tmp_path: Path) -> None:
+        api = tmp_path / "pages" / "api"
+        api.mkdir(parents=True)
+        (api / "user.ts").write_text(
+            "export default async (req, res) => { res.json(load(req)) }\n",
+        )
+        assert _route_surface(tmp_path, "typescript") == {
+            "pages.api.user:default": "Next.js Pages API handler",
+        }
+
+    def test_non_factory_receiver_not_detected(self, tmp_path: Path) -> None:
+        (tmp_path / "c.ts").write_text(
+            "import { app } from './app'\n"
+            "const cache = makeCache()\n"
+            "cache.get('/x', (v) => v)\n"
+            "app.get('/y', (req, res) => res.end())\n"
+            "const srv = express()\n"
+            "srv.listen(3000, () => log('up'))\n"
+            "function setup() { const a = express(); a.get('/z', (q) => q) }\n",
+        )
+        assert _route_surface(tmp_path, "typescript") == {}
+
+
 class TestJavaFrameworks:
     def test_spring_get_mapping_detected(self, tmp_path: Path) -> None:
         (tmp_path / "UserController.java").write_text(

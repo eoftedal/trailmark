@@ -15,7 +15,9 @@ Detection layers (later layers override earlier ones):
      (``@app.task``, ``@shared_task``).
    - JavaScript / TypeScript: NestJS decorators (``@Get``, ``@Post``,
      etc.), Next.js route handlers (App Router ``route.ts`` + HTTP-verb
-     exports, Pages API ``pages/api/**``), AWS Lambda handlers.
+     exports, Pages API ``pages/api/**``), AWS Lambda handlers, Express /
+     Fastify route callbacks (``app.get("/path", (req, res) => ...)`` on a
+     receiver created by ``express()`` / ``Router()`` / ``fastify()``).
    - Java: Spring (``@GetMapping``, ``@PostMapping``, ...), JAX-RS
      (``@GET``, ``@POST``), Kafka ``@KafkaListener``, servlet
      ``doGet``/``doPost``/... methods.
@@ -39,8 +41,8 @@ Detection layers (later layers override earlier ones):
    repository root. Always the authoritative source.
 
 See ``docs/entrypoint-patterns.md`` for the full reference, including
-frameworks not yet implemented (Express / Koa / Fastify, Laravel,
-WordPress, Rails, Cobra, axum, warp, clap, etc.).
+frameworks not yet implemented (Koa, Laravel, WordPress, Rails, Cobra,
+axum, warp, clap, etc.).
 """
 
 from __future__ import annotations
@@ -536,7 +538,53 @@ def _detect_js_ts(
                 description="NestJS controller method",
                 asset_value=AssetValue.HIGH,
             )
-    return None
+    return _detect_route_registration(unit)
+
+
+# Router factories whose return value registers HTTP handlers, mapped to
+# the framework name used in descriptions.
+_ROUTER_FACTORIES = {
+    "express": "Express",
+    "express.Router": "Express",
+    "Router": "Express",
+    "fastify": "Fastify",
+    "Fastify": "Fastify",
+}
+
+_ROUTE_METHOD = re.compile(r"\.(get|post|put|patch|delete|all|use|options|head)$")
+
+
+def _detect_route_registration(unit: CodeUnit) -> EntrypointTag | None:
+    """Detect Express / Fastify handlers registered as callbacks.
+
+    Matches ``app.get("/path", (req, res) => ...)`` and friends using the
+    ``callback_of`` / ``registered_on_factory`` / ``route`` attributes
+    the JS/TS parsers record on anonymous callbacks. The receiver must
+    have been assigned from a known router factory (``express()``,
+    ``express.Router()``, ``Router()``, ``fastify()``) at top level, which
+    keeps unrelated ``cache.get(key, fn)`` calls out.
+    """
+    factory = _unit_attr(unit, "registered_on_factory")
+    callee = _unit_attr(unit, "callback_of")
+    if factory is None or callee is None:
+        return None
+    framework = _ROUTER_FACTORIES.get(factory)
+    method = _ROUTE_METHOD.search(callee)
+    if framework is None or method is None:
+        return None
+    route = _unit_attr(unit, "route")
+    suffix = f" {route}" if route is not None else ""
+    verb = method.group(1)
+    if verb == "use":
+        description = f"{framework} middleware{suffix}"
+    else:
+        description = f"{framework} route {verb.upper()}{suffix}"
+    return EntrypointTag(
+        kind=EntrypointKind.API,
+        trust_level=TrustLevel.UNTRUSTED_EXTERNAL,
+        description=description,
+        asset_value=AssetValue.HIGH,
+    )
 
 
 _NEXTJS_VERBS = frozenset({"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"})

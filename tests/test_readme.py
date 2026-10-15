@@ -17,6 +17,7 @@ from typing import cast
 import pytest
 
 import trailmark
+from trailmark.analysis.entrypoints import _ROUTER_FACTORIES
 from trailmark.cli import build_parser
 from trailmark.parse import supported_languages
 from trailmark.parsers.javascript.parser import _EXTENSIONS as JS_EXTENSIONS
@@ -210,6 +211,26 @@ class TestConfigurationDocs:
         assert "target_external = true" in readme_text
         assert "source_external = true" in readme_text
         assert re.search(r"(?<!source_)(?<!target_)external = true", readme_text) is None
+
+
+class TestEntrypointFrameworkDocs:
+    def test_js_route_frameworks_listed_as_detected(self, readme_text: str) -> None:
+        """Every router factory framework appears in the JS/TS coverage row."""
+        row = next(
+            line
+            for line in readme_text.splitlines()
+            if line.startswith("| JavaScript / TypeScript |")
+        )
+        for framework in set(_ROUTER_FACTORIES.values()):
+            assert framework in row, f"{framework} detected but not listed in README"
+
+    def test_js_route_frameworks_not_listed_as_unimplemented(self, readme_text: str) -> None:
+        """Implemented route frameworks must not stay in the "not yet implemented" list."""
+        sentence = next(
+            line for line in readme_text.splitlines() if "frameworks not yet implemented" in line
+        )
+        for framework in set(_ROUTER_FACTORIES.values()):
+            assert framework not in sentence, f"{framework} is implemented"
 
 
 class TestCLIDefaults:
