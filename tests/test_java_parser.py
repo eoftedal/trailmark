@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import os
 import tempfile
+from pathlib import Path
+
+import pytest
 
 from trailmark.models.edges import EdgeConfidence, EdgeKind
 from trailmark.models.graph import CodeGraph
-from trailmark.models.nodes import NodeKind
+from trailmark.models.nodes import NodeKind, NodeOrigin
 from trailmark.parsers.java.parser import JavaParser
 
 SAMPLE_CODE = """\
@@ -274,3 +277,123 @@ class TestJavaParseDirectory:
                 f.write("not source code")
             graph = parser.parse_directory(tmpdir)
         assert len(graph.nodes) == 0
+
+
+RECORD_JAVA_CODE = """\
+public record Comment(Id id, Body body) implements Serializable {
+    public Comment {
+        if (id == null) throw new IllegalArgumentException("id");
+    }
+    public Body body() { return body; }
+    public static record Id(String value) {
+        public static Id generate() { return new Id("x"); }
+    }
+    public record Body(String text) {}
+    class Inner { void m() { this.n(); } void n() {} }
+}
+enum Color {
+    RED, GREEN;
+    int code() { return Util.f(); }
+}
+class Util { static int f() { return 0; } }
+"""
+
+
+@pytest.fixture
+def record_graph(tmp_path: Path) -> CodeGraph:
+    path = tmp_path / "Comment.java"
+    path.write_text(RECORD_JAVA_CODE)
+    return JavaParser().parse_file(str(path))
+
+
+class TestJavaRecords:
+    def test_record_is_class_tagged_as_record(self, record_graph: CodeGraph) -> None:
+        record = record_graph.nodes["Comment:Comment"]
+        assert record.kind == NodeKind.CLASS
+        assert ("java_type_kind", "record") in record.attributes
+
+    def test_record_implements_edge(self, record_graph: CodeGraph) -> None:
+        implements = [
+            e
+            for e in record_graph.edges
+            if e.kind == EdgeKind.IMPLEMENTS and e.source_id == "Comment:Comment"
+        ]
+        assert len(implements) == 1
+
+    def test_synthetic_accessor_per_component(self, record_graph: CodeGraph) -> None:
+        accessor = record_graph.nodes["Comment:Comment.id"]
+        assert accessor.kind == NodeKind.METHOD
+        assert accessor.origin == NodeOrigin.SYNTHETIC
+        assert accessor.attributes == (("synthetic_reason", "record_accessor"),)
+        assert accessor.return_type is not None
+        assert accessor.return_type.name == "Id"
+        assert record_graph.nodes["Comment:Comment.Id.value"].origin == NodeOrigin.SYNTHETIC
+
+    def test_declared_accessor_wins_over_synthetic(self, record_graph: CodeGraph) -> None:
+        accessor = record_graph.nodes["Comment:Comment.body"]
+        assert accessor.origin == NodeOrigin.SOURCE
+        assert accessor.attributes == ()
+
+    def test_accessors_are_contained_by_record(self, record_graph: CodeGraph) -> None:
+        contains = {
+            (e.source_id, e.target_id) for e in record_graph.edges if e.kind == EdgeKind.CONTAINS
+        }
+        assert ("Comment:Comment", "Comment:Comment.id") in contains
+        assert ("Comment:Comment", "Comment:Comment.body") in contains
+
+    def test_compact_constructor(self, record_graph: CodeGraph) -> None:
+        ctor = record_graph.nodes["Comment:Comment.Comment"]
+        assert ctor.kind == NodeKind.METHOD
+        assert ctor.parameters == ()
+        assert [t.name for t in ctor.exception_types] == ["IllegalArgumentException"]
+        assert ctor.cyclomatic_complexity == 2
+
+
+class TestJavaNestedTypes:
+    def test_nested_types_use_outer_qualified_ids(self, record_graph: CodeGraph) -> None:
+        for node_id in ("Comment:Comment.Id", "Comment:Comment.Body", "Comment:Comment.Inner"):
+            assert node_id in record_graph.nodes
+        assert record_graph.nodes["Comment:Comment.Id"].name == "Id"
+        assert "Comment:Comment.Id.generate" in record_graph.nodes
+        assert "Comment:Comment.Inner.n" in record_graph.nodes
+
+    def test_nested_types_are_contained_by_outer_type(self, record_graph: CodeGraph) -> None:
+        contains = {
+            (e.source_id, e.target_id) for e in record_graph.edges if e.kind == EdgeKind.CONTAINS
+        }
+        assert ("Comment:Comment", "Comment:Comment.Id") in contains
+        assert ("Comment:Comment.Id", "Comment:Comment.Id.generate") in contains
+        assert ("Comment", "Comment:Comment.Id") not in contains
+
+    def test_unqualified_call_in_nested_type_targets_nested_type(
+        self, record_graph: CodeGraph
+    ) -> None:
+        callers = {e.source_id for e in record_graph.edges if e.kind == EdgeKind.CALLS}
+        assert "Comment:Comment.Inner.m" in callers
+
+    def test_deeply_nested_types_do_not_recurse(self, tmp_path: Path) -> None:
+        depth = 1500
+        source = "class C { " * depth + "void m() {}" + " }" * depth
+        path = tmp_path / "Deep.java"
+        path.write_text(source)
+        graph = JavaParser().parse_file(str(path))
+        innermost = "Deep:" + ".".join(["C"] * depth)
+        assert f"{innermost}.m" in graph.nodes
+
+
+class TestJavaEnumBodyMethods:
+    def test_enum_body_methods_are_extracted(self, record_graph: CodeGraph) -> None:
+        code = record_graph.nodes["Comment:Color.code"]
+        assert code.kind == NodeKind.METHOD
+        contains = {
+            (e.source_id, e.target_id) for e in record_graph.edges if e.kind == EdgeKind.CONTAINS
+        }
+        assert ("Comment:Color", "Comment:Color.code") in contains
+
+    def test_enum_body_method_calls_are_extracted(self, record_graph: CodeGraph) -> None:
+        targets = {
+            e.target_id
+            for e in record_graph.edges
+            if e.kind == EdgeKind.CALLS and e.source_id == "Comment:Color.code"
+        }
+        assert targets == {"Util.f"}

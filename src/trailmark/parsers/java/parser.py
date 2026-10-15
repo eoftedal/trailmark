@@ -10,9 +10,11 @@ from tree_sitter_language_pack import get_language
 from trailmark.models.edges import CodeEdge, EdgeConfidence, EdgeKind
 from trailmark.models.graph import CodeGraph
 from trailmark.models.nodes import (
+    Attribute,
     BranchInfo,
     CodeUnit,
     NodeKind,
+    NodeOrigin,
     Parameter,
     TypeRef,
 )
@@ -49,7 +51,10 @@ _CLASS_NODE_KINDS: dict[str, NodeKind] = {
     "class_declaration": NodeKind.CLASS,
     "interface_declaration": NodeKind.INTERFACE,
     "enum_declaration": NodeKind.ENUM,
+    "record_declaration": NodeKind.CLASS,
 }
+
+_RECORD_DECLARATION = "record_declaration"
 
 _FUNCTION_TYPES = frozenset(
     {"method_declaration", "constructor_declaration"},
@@ -124,51 +129,111 @@ def _extract_class(
     module_id: str,
     graph: CodeGraph,
 ) -> None:
-    """Extract a class, interface, or enum declaration."""
+    """Extract a top-level type declaration and every type nested in it.
+
+    Nested declarations are processed with an explicit work stack rather
+    than recursion so deeply nested types from untrusted sources cannot
+    exhaust the Python stack. The stack replays the order a recursive
+    walk would use: a type, then its members in source order (nested
+    types depth-first), then any synthetic record accessors.
+    """
+    stack: list[tuple[str, Node, str | None]] = [("type", node, None)]
+    while stack:
+        action, item, owner_id = stack.pop()
+        if action == "type":
+            class_id = _add_class_node(item, file_path, module_id, owner_id, graph)
+            if class_id is None:
+                continue
+            if item.type == _RECORD_DECLARATION:
+                stack.append(("accessors", item, class_id))
+            body = item.child_by_field_name("body")
+            if body is not None:
+                stack.extend(("member", child, class_id) for child in reversed(body.children))
+        elif owner_id is None:  # only top-level types have no owner
+            continue
+        elif action == "accessors":
+            _add_record_accessors(item, file_path, owner_id, graph)
+        elif item.type in _FUNCTION_TYPES or item.type == "compact_constructor_declaration":
+            _extract_function(item, file_path, module_id, owner_id, graph)
+        elif item.type in _CLASS_NODE_KINDS:
+            stack.append(("type", item, owner_id))
+        elif item.type == "enum_body_declarations":
+            stack.extend(("member", child, owner_id) for child in reversed(item.children))
+
+
+def _add_class_node(
+    node: Node,
+    file_path: str,
+    module_id: str,
+    parent_id: str | None,
+    graph: CodeGraph,
+) -> str | None:
+    """Add a class, interface, enum, or record node and its type edges.
+
+    Top-level types are ``module:Name``; nested types extend the
+    enclosing type's ID (``module:Outer.Inner``) and are contained by it.
+    """
     name_node = node.child_by_field_name("name")
     if name_node is None:
-        return
+        return None
     class_name = node_text(name_node)
-    class_id = f"{module_id}:{class_name}"
+    class_id = f"{module_id}:{class_name}" if parent_id is None else f"{parent_id}.{class_name}"
     kind = _CLASS_NODE_KINDS.get(node.type, NodeKind.CLASS)
-    location = make_location(node, file_path)
+    attributes: tuple[Attribute, ...] = ()
+    if node.type == _RECORD_DECLARATION:
+        attributes = (("java_type_kind", "record"),)
 
     class_unit = CodeUnit(
         id=class_id,
         name=class_name,
         kind=kind,
-        location=location,
+        location=make_location(node, file_path),
         type_parameters=extract_type_parameters(node),
         docstring=_extract_docstring(node),
+        attributes=attributes,
     )
     graph.nodes[class_id] = class_unit
-    add_contains_edge(graph, module_id, class_id)
+    add_contains_edge(graph, parent_id or module_id, class_id)
 
     _extract_inheritance(node, class_id, module_id, graph)
     _extract_implements(node, class_id, module_id, graph)
-    _visit_class_body(node, file_path, module_id, class_id, graph)
+    return class_id
 
 
-def _visit_class_body(
+def _add_record_accessors(
     node: Node,
     file_path: str,
-    module_id: str,
     class_id: str,
     graph: CodeGraph,
 ) -> None:
-    """Visit children of a class body."""
-    body = node.child_by_field_name("body")
-    if body is None:
+    """Add the implicit accessor of each record component.
+
+    Java generates ``name()`` for every component unless the record body
+    declares it, so an explicitly declared accessor (already extracted
+    from the body) is kept as-is.
+    """
+    components = node.child_by_field_name("parameters")
+    if components is None:
         return
-    for child in body.children:
-        if child.type in _FUNCTION_TYPES:
-            _extract_function(
-                child,
-                file_path,
-                module_id,
-                class_id,
-                graph,
-            )
+    for component in components.named_children:
+        if component.type != "formal_parameter":
+            continue
+        name_node = component.child_by_field_name("name")
+        name = node_text(name_node) if name_node is not None else ""
+        accessor_id = f"{class_id}.{name}"
+        if not name or accessor_id in graph.nodes:
+            continue
+        type_node = component.child_by_field_name("type")
+        graph.nodes[accessor_id] = CodeUnit(
+            id=accessor_id,
+            name=name,
+            kind=NodeKind.METHOD,
+            location=make_location(component, file_path),
+            return_type=_parse_type_node(type_node) if type_node is not None else None,
+            origin=NodeOrigin.SYNTHETIC,
+            attributes=(("synthetic_reason", "record_accessor"),),
+        )
+        add_contains_edge(graph, class_id, accessor_id)
 
 
 def _extract_inheritance(

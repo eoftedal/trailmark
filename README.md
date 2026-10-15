@@ -50,7 +50,7 @@ A language-specific parser walks the directory, parses each file into a tree-sit
 | C | `.c`, `.h` | functions, structs, enums |
 | C++ | `.cpp`, `.hpp`, `.cc`, `.hh`, `.cxx`, `.hxx` | functions, classes, structs, namespaces |
 | C# | `.cs` | methods, classes, interfaces, structs, enums, namespaces |
-| Java | `.java` | methods, classes, interfaces, enums |
+| Java | `.java` | methods, classes, interfaces, enums, records (with implicit accessors), nested types |
 | Go | `.go` | functions, methods, structs, interfaces |
 | Rust | `.rs` | functions, structs, traits, enums, impl blocks |
 | Solidity | `.sol` | contracts, interfaces, libraries, functions, modifiers, structs, enums |
