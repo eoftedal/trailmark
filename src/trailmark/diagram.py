@@ -51,6 +51,17 @@ def node_label(node: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
+def mermaid_label(node: dict[str, Any]) -> str:
+    """Build ``node_label`` escaped for a quoted Mermaid label (``id["..."]``).
+
+    A raw ``"`` ends the quoted label early, and Mermaid then rejects the
+    whole diagram. Unresolved-call proxies are named after the call text, so
+    any call with a string argument (``rs.getString("id")``) triggers this.
+    Mermaid renders the ``#quot;`` entity as ``"``.
+    """
+    return node_label(node).replace('"', "#quot;")
+
+
 def edge_style(confidence: str) -> str:
     """Return a Mermaid arrow based on edge confidence."""
     if confidence == "inferred":
@@ -326,7 +337,7 @@ def emit_complexity(
     lines = [f"flowchart {direction}"]
     for nid, n in cc_nodes.items():
         sid = sanitize_id(nid)
-        label = node_label(n)
+        label = mermaid_label(n)
         cls = complexity_class(n.get("cyclomatic_complexity"))
         lines.append(f'    {sid}["{label}"]:::{cls}')
 
@@ -379,7 +390,7 @@ def emit_data_flow(
     lines = [f"flowchart {direction}"]
     for nid, n in all_path_nodes.items():
         sid = sanitize_id(nid)
-        label = node_label(n)
+        label = mermaid_label(n)
         if nid in ep_ids:
             lines.append(f'    {sid}(["{label}"]):::entrypoint')
         else:
@@ -436,7 +447,7 @@ def _render_flowchart(
     lines = [f"flowchart {direction}"]
     for nid, n in nodes.items():
         sid = sanitize_id(nid)
-        label = node_label(n)
+        label = mermaid_label(n)
         lines.append(f'    {sid}["{label}"]')
     for src, tgt, conf in edges:
         lines.append(f"    {sanitize_id(src)} {edge_style(conf)} {sanitize_id(tgt)}")

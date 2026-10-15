@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 
 from trailmark import diagram
@@ -190,6 +192,19 @@ class TestNodeLabel:
         assert label == "x, CC=3"
 
 
+class TestMermaidLabel:
+    def test_escapes_double_quotes(self) -> None:
+        label = diagram.mermaid_label({"name": 'rs.getString("id").trim', "kind": "proxy"})
+        assert label == "rs.getString(#quot;id#quot;).trim, proxy"
+
+    def test_matches_node_label_without_quotes(self) -> None:
+        node = {"name": "bar", "kind": "method", "cyclomatic_complexity": 15}
+        assert diagram.mermaid_label(node) == diagram.node_label(node)
+
+    def test_node_label_is_unescaped(self) -> None:
+        assert diagram.node_label({"name": 'f("x")', "kind": "proxy"}) == 'f("x"), proxy'
+
+
 class TestEdgeStyle:
     def test_certain(self) -> None:
         assert diagram.edge_style("certain") == "-->"
@@ -321,6 +336,46 @@ class TestEmitDataFlow:
         engine = _build_class_hierarchy_engine()
         result = diagram.emit_data_flow(engine, None, 5, "TB")
         assert "No entrypoints found" in result
+
+
+def _build_quoted_name_engine() -> QueryEngine:
+    """Engine whose nodes have ``"`` in their names, like call-text proxies."""
+    nodes = {
+        "mod:entry": _make_node("mod:entry", "entry", complexity=2),
+        "mod:load": _make_node("mod:load", 'load("users")', complexity=12),
+    }
+    edges = [CodeEdge(source_id="mod:entry", target_id="mod:load", kind=EdgeKind.CALLS)]
+    graph = CodeGraph(
+        nodes=nodes,
+        edges=edges,
+        entrypoints={"mod:entry": EntrypointTag(kind=EntrypointKind.USER_INPUT)},
+    )
+    return QueryEngine.from_graph(graph)
+
+
+def _quoted_labels(result: str) -> list[str]:
+    """Text between ``["`` and ``"]`` on each node line."""
+    return [
+        line.split('["', 1)[1].rsplit('"]', 1)[0] for line in result.splitlines() if '["' in line
+    ]
+
+
+class TestQuotedNodeNames:
+    @pytest.mark.parametrize(
+        "render",
+        [
+            lambda e: diagram.emit_call_graph(e, "entry", 2, "TB"),
+            lambda e: diagram.emit_call_graph(e, None, 2, "TB"),
+            lambda e: diagram.emit_complexity(e, 1, "TB"),
+            lambda e: diagram.emit_data_flow(e, "mod:load", 5, "TB"),
+        ],
+        ids=["call-graph-focus", "call-graph", "complexity", "data-flow"],
+    )
+    def test_labels_never_contain_raw_quotes(self, render: Callable[[QueryEngine], str]) -> None:
+        result = render(_build_quoted_name_engine())
+        labels = _quoted_labels(result)
+        assert any("#quot;users#quot;" in label for label in labels)
+        assert all('"' not in label for label in labels)
 
 
 # ── CLI argument parsing ─────────────────────────────────────────
