@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+import subprocess
+from dataclasses import replace
 from pathlib import Path
 
-from tree_sitter import Node, Parser
+from tree_sitter import Language, Node, Parser, Range, Tree
 from tree_sitter_language_pack import get_language
 
 from trailmark.models.edges import CodeEdge, EdgeConfidence, EdgeKind
@@ -14,6 +17,7 @@ from trailmark.models.nodes import (
     CodeUnit,
     NodeKind,
     Parameter,
+    SourceLocation,
     TypeRef,
 )
 from trailmark.parsers._common import (
@@ -27,6 +31,9 @@ from trailmark.parsers._common import (
     node_text,
     parse_directory,
 )
+from trailmark.parsers.rust._scopes import resolve_calls
+
+_LOGGER = logging.getLogger(__name__)
 
 _BRANCH_NODE_TYPES = frozenset(
     {
@@ -64,6 +71,10 @@ class RustParser:
 
     def __init__(self) -> None:
         self._parser = Parser(get_language("rust"))
+        self._verus_parser: Parser | None = None
+        self._verus_load_failed = False
+        self._uses: list[tuple[str, Node]] = []
+        self._declarations: dict[str, Node] = {}
 
     def parse_file(self, file_path: str) -> CodeGraph:
         """Parse a single Rust file into a CodeGraph."""
@@ -71,8 +82,101 @@ class RustParser:
         tree = self._parser.parse(source)
         graph = CodeGraph(language="rust", root_path=file_path)
         module_id = module_id_from_path(file_path)
-        _visit_module(tree.root_node, file_path, module_id, graph)
+        self._uses = []
+        self._declarations = {}
+        add_module_node(tree.root_node, file_path, module_id, graph)
+        self._visit_scope(tree.root_node, source, file_path, module_id, graph)
+        resolve_calls(graph, self._uses, module_id, self._declarations)
         return graph
+
+    def _visit_scope(
+        self, root: Node, source: bytes, file_path: str, module_id: str, graph: CodeGraph
+    ) -> None:
+        """Visit declarations while retaining their module and method owners."""
+        stack: list[tuple[Node, str, str | None]] = [
+            (child, module_id, None) for child in reversed(_declarations_in(root))
+        ]
+        has_verus = b"verus" in source
+        while stack:
+            child, module_id, container_id = stack.pop()
+            if child.type == "macro_invocation" and has_verus:
+                tree = self._parse_macro(source, child, file_path)
+                declarations = _declarations_in(tree.root_node) if tree is not None else []
+            else:
+                self._record_use(child, module_id, container_id, graph)
+                module_id, container_id, declarations = _visit_declaration(
+                    child, file_path, module_id, container_id, graph, source=source
+                )
+                self._record_declaration(child, module_id, container_id)
+                if child.type == "function_item":
+                    _warn_hidden_verus(child, file_path, "inside a function body")
+            stack.extend((nested, module_id, container_id) for nested in reversed(declarations))
+
+    def _record_use(
+        self, node: Node, module_id: str, container_id: str | None, graph: CodeGraph
+    ) -> None:
+        if node.type == "use_declaration":
+            self._uses.append((container_id or module_id, node))
+
+    def _record_declaration(self, node: Node, module: str, container: str | None) -> None:
+        if node.type == "mod_item":
+            if node.child_by_field_name("body") is not None:
+                self._declarations[container or module] = node
+        elif container is not None and node.type in {
+            "function_item",
+            "struct_item",
+            "enum_item",
+            "trait_item",
+        }:
+            self._declarations[container] = node
+
+    def _parse_macro(self, source: bytes, node: Node, file_path: str) -> Tree | None:
+        if _enclosing_function(node) is not None:
+            return None
+        name = _macro_name(node)
+        if name is not None and node_text(name) == "verus":
+            return self._parse_verus_block(source, node, file_path)
+        _warn_hidden_verus(node, file_path, "inside an opaque macro")
+        return None
+
+    def _load_verus_parser(self) -> Parser | None:
+        if self._verus_parser is None and not self._verus_load_failed:
+            try:
+                from trailmark.tree_sitter_custom.verus import language as verus_language
+
+                self._verus_parser = Parser(Language(verus_language()))
+            except (
+                OSError,
+                subprocess.SubprocessError,
+                ImportError,
+                ValueError,
+                AttributeError,
+            ) as exc:
+                self._verus_load_failed = True
+                _LOGGER.warning("Could not load the Verus grammar; skipping verus! blocks: %s", exc)
+        return self._verus_parser
+
+    def _parse_verus_block(self, source: bytes, node: Node, file_path: str) -> Tree | None:
+        """Parse one block independently so error recovery cannot consume its neighbors."""
+        token_tree = next(
+            (child for child in node.named_children if child.type == "token_tree"), None
+        )
+        opening = token_tree.child(0) if token_tree is not None else None
+        if opening is None or opening.type != "{":
+            _warn_skipped(node, file_path, "unsupported Verus delimiter; expected braces")
+            return None
+        parser = self._load_verus_parser()
+        if parser is None:
+            return None
+        name = _macro_name(node)
+        start = name if name is not None else node
+        parser.included_ranges = [
+            Range(start.start_point, node.end_point, start.start_byte, node.end_byte)
+        ]
+        tree = parser.parse(_mask_unsupported_verus(source, node, file_path))
+        if tree.root_node.has_error:
+            _warn_skipped(node, file_path, "Verus syntax errors; graph may be incomplete")
+        return tree
 
     def parse_directory(self, dir_path: str) -> CodeGraph:
         """Parse all .rs files under dir_path into a merged graph."""
@@ -84,16 +188,79 @@ class RustParser:
         )
 
 
-def _visit_module(
-    root: Node,
-    file_path: str,
-    module_id: str,
-    graph: CodeGraph,
-) -> None:
-    """Walk the top-level of a module, extracting nodes and edges."""
-    add_module_node(root, file_path, module_id, graph)
-    for child in root.children:
-        _visit_top_level_node(child, file_path, module_id, graph)
+def _macro_name(node: Node) -> Node | None:
+    macro = node.child_by_field_name("macro")
+    if macro is not None and macro.type == "scoped_identifier":
+        return macro.child_by_field_name("name")
+    return macro
+
+
+def _mask_unsupported_verus(source: bytes, node: Node, file_path: str) -> bytes:
+    masked = bytearray(source)
+    for name, tokens in _verus_token_trees(node):
+        delimiter = tokens.child(0)
+        if delimiter is not None and delimiter.type != "{":
+            _warn_skipped(name, file_path, "unsupported Verus delimiter; expected braces")
+            # An opaque macro remains valid in both declaration and expression positions.
+            masked[name.start_byte : name.end_byte] = b"vskip"
+    return bytes(masked)
+
+
+def _verus_token_trees(root: Node) -> list[tuple[Node, Node]]:
+    """Find literal Verus invocations, including qualified names in token trees."""
+    invocations: list[tuple[Node, Node]] = []
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "macro_definition":
+            continue
+        if node.type == "function_item" and node != root:
+            continue
+        if node.type == "verus_block":
+            invocations.append((node, node))
+            continue
+        children = [child for child in node.children if not child.is_extra]
+        definitions = {
+            children[index + 3].id
+            for index, child in enumerate(children[:-3])
+            if child.type == "identifier"
+            and node_text(child) == "macro_rules"
+            and children[index + 1].type == "!"
+            and children[index + 2].type == "identifier"
+            and children[index + 3].type == "token_tree"
+        }
+        for index, child in enumerate(children[:-2]):
+            if (
+                child.type in {"identifier", "scoped_identifier"}
+                and node_text(child.child_by_field_name("name") or child) == "verus"
+                and children[index + 1].type == "!"
+                and children[index + 2].type == "token_tree"
+            ):
+                name = (
+                    child.child_by_field_name("name")
+                    if child.type == "scoped_identifier"
+                    else child
+                )
+                if name is not None:
+                    invocations.append((name, children[index + 2]))
+        stack.extend(
+            child for child in reversed(node.named_children) if child.id not in definitions
+        )
+    return invocations
+
+
+def _warn_skipped(node: Node, file_path: str, reason: str) -> None:
+    _LOGGER.warning(
+        "%s:%d:%d: %s", file_path, node.start_point.row + 1, node.start_point.column + 1, reason
+    )
+
+
+def _warn_hidden_verus(node: Node, file_path: str, reason: str) -> None:
+    if b"verus" not in (node.text or b""):
+        return
+    invocations = _verus_token_trees(node)
+    if invocations:
+        _warn_skipped(invocations[0][0], file_path, f"skipping Verus declarations {reason}")
 
 
 def _visit_top_level_node(
@@ -101,111 +268,46 @@ def _visit_top_level_node(
     file_path: str,
     module_id: str,
     graph: CodeGraph,
-) -> None:
+    *,
+    container_id: str | None = None,
+) -> str | None:
     """Dispatch a single top-level node."""
-    if child.type == "function_item":
-        _extract_function(child, file_path, module_id, None, graph)
-    elif child.type == "struct_item":
-        _extract_struct(child, file_path, module_id, graph)
-    elif child.type == "trait_item":
-        _extract_trait(child, file_path, module_id, graph)
+    if child.type == "struct_item":
+        return _extract_type(
+            child, file_path, module_id, graph, NodeKind.STRUCT, owner=container_id
+        )
     elif child.type == "enum_item":
-        _extract_enum(child, file_path, module_id, graph)
-    elif child.type == "impl_item":
-        _extract_impl(child, file_path, module_id, graph)
+        return _extract_type(child, file_path, module_id, graph, NodeKind.ENUM, owner=container_id)
     elif child.type == "use_declaration":
         _extract_import(child, graph)
+    return None
 
 
-def _extract_struct(
+def _extract_type(
     node: Node,
     file_path: str,
     module_id: str,
     graph: CodeGraph,
-) -> None:
-    """Extract a struct definition."""
+    kind: NodeKind,
+    *,
+    owner: str | None = None,
+) -> str | None:
+    """Extract a struct, enum, or trait with its lexical owner."""
     name_node = node.child_by_field_name("name")
     if name_node is None:
-        return
-    struct_name = node_text(name_node)
-    struct_id = f"{module_id}:{struct_name}"
-    docstring = _extract_docstring(node)
-
-    unit = CodeUnit(
-        id=struct_id,
-        name=struct_name,
-        kind=NodeKind.STRUCT,
+        return None
+    name = node_text(name_node)
+    type_id = _scoped_id(node, name, module_id, owner, graph)
+    graph.nodes[type_id] = CodeUnit(
+        id=type_id,
+        name=name,
+        kind=kind,
         location=make_location(node, file_path),
-        type_parameters=extract_type_parameters(node),
-        docstring=docstring,
+        type_parameters=extract_type_parameters(node, field_name="type_parameters"),
+        docstring=_extract_docstring(node),
     )
-    graph.nodes[struct_id] = unit
-    add_contains_edge(graph, module_id, struct_id)
-
-
-def _extract_trait(
-    node: Node,
-    file_path: str,
-    module_id: str,
-    graph: CodeGraph,
-) -> None:
-    """Extract a trait definition and its method signatures."""
-    name_node = node.child_by_field_name("name")
-    if name_node is None:
-        return
-    trait_name = node_text(name_node)
-    trait_id = f"{module_id}:{trait_name}"
-    docstring = _extract_docstring(node)
-
-    unit = CodeUnit(
-        id=trait_id,
-        name=trait_name,
-        kind=NodeKind.TRAIT,
-        location=make_location(node, file_path),
-        type_parameters=extract_type_parameters(node),
-        docstring=docstring,
-    )
-    graph.nodes[trait_id] = unit
-    add_contains_edge(graph, module_id, trait_id)
-
-    body = node.child_by_field_name("body")
-    if body is None:
-        return
-    for child in body.children:
-        if child.type == "function_item":
-            _extract_function(
-                child,
-                file_path,
-                module_id,
-                trait_id,
-                graph,
-            )
-
-
-def _extract_enum(
-    node: Node,
-    file_path: str,
-    module_id: str,
-    graph: CodeGraph,
-) -> None:
-    """Extract an enum definition."""
-    name_node = node.child_by_field_name("name")
-    if name_node is None:
-        return
-    enum_name = node_text(name_node)
-    enum_id = f"{module_id}:{enum_name}"
-    docstring = _extract_docstring(node)
-
-    unit = CodeUnit(
-        id=enum_id,
-        name=enum_name,
-        kind=NodeKind.ENUM,
-        location=make_location(node, file_path),
-        type_parameters=extract_type_parameters(node),
-        docstring=docstring,
-    )
-    graph.nodes[enum_id] = unit
-    add_contains_edge(graph, module_id, enum_id)
+    add_contains_edge(graph, owner or module_id, type_id)
+    return type_id
 
 
 def _extract_impl(
@@ -213,29 +315,148 @@ def _extract_impl(
     file_path: str,
     module_id: str,
     graph: CodeGraph,
-) -> None:
+    *,
+    container_id: str | None = None,
+) -> str | None:
     """Extract an impl block, with optional trait implementation."""
     type_name = _extract_impl_type_name(node)
     if not type_name:
-        return
-    type_id = f"{module_id}:{type_name}"
+        return None
+    type_id = _impl_type_id(node, type_name, module_id, container_id, graph)
 
     trait_node = node.child_by_field_name("trait")
     if trait_node is not None:
-        _add_implements_edge(trait_node, type_id, module_id, graph)
+        _add_implements_edge(trait_node, type_id, module_id, graph, file_path=file_path)
 
+    return type_id
+
+
+def _impl_type_id(node: Node, name: str, module: str, owner: str | None, graph: CodeGraph) -> str:
+    if owner is None:
+        return f"{module}:{name}"
+    parent = node.parent
+    while parent is not None and parent.type != "function_item":
+        if parent.type == "block":
+            for child in _declarations_in(parent):
+                if child.type not in {"struct_item", "enum_item"}:
+                    continue
+                child_name = child.child_by_field_name("name")
+                if child_name is not None and node_text(child_name) == name:
+                    return _scoped_id(child, name, module, owner, graph)
+        parent = parent.parent
+    return f"{owner}.{name}"
+
+
+def _declarations_in(node: Node) -> list[Node]:
+    """Unwrap declarations emitted by either Rust grammar."""
+    declarations: list[Node] = []
+    stack = list(reversed(node.named_children))
+    while stack:
+        child = stack.pop()
+        if child.type in {"verus_block", "declaration_with_attrs", "expression_statement"}:
+            stack.extend(reversed(child.named_children))
+        else:
+            declarations.append(child)
+    return declarations
+
+
+def _enclosing_function(node: Node) -> Node | None:
+    parent = node.parent
+    while parent is not None:
+        if parent.type == "function_item":
+            return parent
+        parent = parent.parent
+    return None
+
+
+def _is_function(node_id: str | None, graph: CodeGraph) -> bool:
+    return (
+        node_id is not None
+        and node_id in graph.nodes
+        and graph.nodes[node_id].kind
+        in {
+            NodeKind.FUNCTION,
+            NodeKind.METHOD,
+        }
+    )
+
+
+def _local_declarations(body: Node | None) -> list[Node]:
+    declarations: list[Node] = []
+    stack = list(reversed(body.named_children)) if body is not None else []
+    while stack:
+        child = stack.pop()
+        if child.type in {
+            "function_item",
+            "use_declaration",
+            "mod_item",
+            "impl_item",
+            "trait_item",
+            "struct_item",
+            "enum_item",
+        }:
+            declarations.append(child)
+        elif child.type not in {
+            "macro_invocation",
+            "verus_block",
+            "macro_definition",
+        }:
+            stack.extend(reversed(child.named_children))
+    return declarations
+
+
+def _visit_declaration(
+    node: Node,
+    file_path: str,
+    module_id: str,
+    container_id: str | None,
+    graph: CodeGraph,
+    *,
+    source: bytes,
+) -> tuple[str, str | None, list[Node]]:
     body = node.child_by_field_name("body")
-    if body is None:
-        return
-    for child in body.children:
-        if child.type == "function_item":
-            _extract_function(
-                child,
-                file_path,
-                module_id,
-                type_id,
-                graph,
-            )
+    if node.type == "function_item":
+        function_id = _extract_function(
+            node, file_path, module_id, container_id, graph, source=source
+        )
+        return module_id, function_id, _local_declarations(body)
+    if node.type == "mod_item":
+        name = node.child_by_field_name("name")
+        if name is not None and body is not None:
+            parent_id = container_id or module_id
+            if container_id is not None:
+                container_id = _scoped_id(node, node_text(name), module_id, container_id, graph)
+                child_id = container_id
+            else:
+                module_id = f"{module_id}.{node_text(name)}"
+                child_id = module_id
+            add_module_node(node, file_path, child_id, graph)
+            add_contains_edge(graph, parent_id, child_id)
+    elif node.type == "trait_item":
+        container_id = _extract_type(
+            node, file_path, module_id, graph, NodeKind.TRAIT, owner=container_id
+        )
+    elif node.type == "impl_item":
+        container_id = _extract_impl(node, file_path, module_id, graph, container_id=container_id)
+    else:
+        container_id = _visit_top_level_node(
+            node, file_path, module_id, graph, container_id=container_id
+        )
+        body = None
+    return module_id, container_id, _declarations_in(body) if body is not None else []
+
+
+def _scoped_id(node: Node, name: str, module: str, owner: str | None, graph: CodeGraph) -> str:
+    if owner is None:
+        return f"{module}:{name}"
+    node_id = f"{owner}.{name}"
+    existing = graph.nodes.get(node_id)
+    local = _is_function(owner, graph) or "." in owner.partition(":")[2]
+    if local and existing is not None:
+        start = (existing.location.start_line - 1, existing.location.start_col)
+        if start != node.start_point:
+            return f"{node_id}@{node.start_byte}"
+    return node_id
 
 
 def _extract_impl_type_name(node: Node) -> str:
@@ -257,6 +478,8 @@ def _add_implements_edge(
     type_id: str,
     module_id: str,
     graph: CodeGraph,
+    *,
+    file_path: str,
 ) -> None:
     """Add an IMPLEMENTS edge from type to trait."""
     trait_name = node_text(trait_node)
@@ -267,6 +490,7 @@ def _add_implements_edge(
             target_id=trait_id,
             kind=EdgeKind.IMPLEMENTS,
             confidence=EdgeConfidence.CERTAIN,
+            location=make_location(trait_node, file_path),
         )
     )
 
@@ -277,62 +501,55 @@ def _extract_function(
     module_id: str,
     container_id: str | None,
     graph: CodeGraph,
-) -> None:
+    *,
+    source: bytes,
+) -> str | None:
     """Extract a function or method definition."""
     name_node = node.child_by_field_name("name")
     if name_node is None:
-        return
+        return None
     func_name = node_text(name_node)
 
-    if container_id is not None:
-        func_id = f"{container_id}.{func_name}"
-        kind = NodeKind.METHOD
-        owner = container_id
-    else:
-        func_id = f"{module_id}:{func_name}"
-        kind = NodeKind.FUNCTION
-        owner = module_id
+    func_id = _scoped_id(node, func_name, module_id, container_id, graph)
+    owner = container_id or module_id
+    owner_node = graph.nodes.get(owner)
+    method = container_id is not None and not _is_function(owner, graph)
+    if owner_node is not None and owner_node.kind == NodeKind.MODULE:
+        method = False
+    kind = NodeKind.METHOD if method else NodeKind.FUNCTION
 
-    params = _extract_parameters(node)
-    return_type = _extract_return_type(node)
     body = node.child_by_field_name("body")
 
     branches, exception_types, calls = _collect_func_body(
         body,
         file_path,
+        source,
     )
-    complexity = compute_complexity(branches)
-    docstring = _extract_docstring(node)
 
     unit = CodeUnit(
         id=func_id,
         name=func_name,
         kind=kind,
         location=make_location(node, file_path),
-        parameters=tuple(params),
-        return_type=return_type,
+        parameters=tuple(_extract_parameters(node)),
+        return_type=_extract_return_type(node),
         exception_types=tuple(exception_types),
-        type_parameters=extract_type_parameters(node),
-        cyclomatic_complexity=complexity,
+        type_parameters=extract_type_parameters(node, field_name="type_parameters"),
+        cyclomatic_complexity=compute_complexity(branches),
         branches=tuple(branches),
-        docstring=docstring,
+        docstring=_extract_docstring(node),
     )
     graph.nodes[func_id] = unit
     add_contains_edge(graph, owner, func_id)
 
-    _add_call_edges(
-        calls,
-        func_id,
-        module_id,
-        container_id,
-        file_path,
-        graph,
-    )
+    _add_call_edges(calls, func_id, module_id, file_path, graph)
+    return func_id
 
 
 def _collect_func_body(
     body: Node | None,
     file_path: str,
+    source: bytes,
 ) -> tuple[list[BranchInfo], list[TypeRef], list[tuple[str, Node]]]:
     """Collect branches, exceptions, and calls from a function body."""
     branches: list[BranchInfo] = []
@@ -348,8 +565,40 @@ def _collect_func_body(
             branches,
             exception_types,
             calls,
+            skip_types=frozenset(
+                {
+                    "verus_block",
+                    "macro_invocation",
+                    "macro_definition",
+                    "function_item",
+                    "impl_item",
+                    "trait_item",
+                    "mod_item",
+                }
+            ),
         )
+        if b"vskip" in (body.text or b""):
+            conditions = _original_conditions(body, source, file_path)
+            branches = [
+                replace(branch, condition=conditions.get(branch.location, branch.condition))
+                for branch in branches
+            ]
     return branches, exception_types, calls
+
+
+def _original_conditions(body: Node, source: bytes, file_path: str) -> dict[SourceLocation, str]:
+    """Keep synthetic macro names out of user-facing branch conditions."""
+    conditions: dict[SourceLocation, str] = {}
+    stack = [body]
+    while stack:
+        node = stack.pop()
+        condition = node.child_by_field_name("condition")
+        if node.type in _BRANCH_NODE_TYPES and condition is not None:
+            conditions[make_location(node, file_path)] = source[
+                condition.start_byte : condition.end_byte
+            ].decode("utf-8", errors="replace")
+        stack.extend(node.named_children)
+    return conditions
 
 
 def _extract_parameters(node: Node) -> list[Parameter]:
@@ -384,6 +633,11 @@ def _extract_single_param(
 def _extract_return_type(node: Node) -> TypeRef | None:
     """Extract the return type from a function definition."""
     return_type = node.child_by_field_name("return_type")
+    if return_type is not None and return_type.type == "named_return_type":
+        # The final non-extra child is the type, after any name or tracked marker.
+        return_type = next(
+            (child for child in reversed(return_type.named_children) if not child.is_extra), None
+        )
     if return_type is None:
         return None
     return TypeRef(name=node_text(return_type))
@@ -392,12 +646,22 @@ def _extract_return_type(node: Node) -> TypeRef | None:
 def _extract_docstring(node: Node) -> str | None:
     """Extract doc comments (///) preceding a node."""
     lines: list[str] = []
-    prev = node.prev_named_sibling
-    while prev is not None and prev.type == "line_comment":
+    while True:
+        prev = node.prev_named_sibling
+        if prev is None:
+            parent = node.parent
+            if parent is None or parent.type != "declaration_with_attrs":
+                break
+            node = parent
+            continue
+        node = prev
+        if prev.type == "attribute_item":
+            continue
+        if prev.type != "line_comment":
+            break
         text = node_text(prev)
-        if text.startswith("///") or text.startswith("//!"):
+        if text.startswith("///") and not text.startswith("////"):
             lines.append(text[3:].strip())
-            prev = prev.prev_named_sibling
         else:
             break
     if not lines:
@@ -410,7 +674,6 @@ def _add_call_edges(
     calls: list[tuple[str, Node]],
     source_id: str,
     module_id: str,
-    container_id: str | None,
     file_path: str,
     graph: CodeGraph,
 ) -> None:
@@ -419,7 +682,6 @@ def _add_call_edges(
         target_id = _resolve_call_target(
             call_name,
             module_id,
-            container_id,
         )
         confidence = _call_confidence(call_name)
         graph.edges.append(
@@ -443,7 +705,6 @@ def _call_confidence(call_name: str) -> EdgeConfidence:
 def _resolve_call_target(
     call_name: str,
     module_id: str,
-    container_id: str | None,
 ) -> str:
     """Resolve a call name to a target node ID."""
     if "." not in call_name and "::" not in call_name:

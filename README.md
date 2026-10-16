@@ -52,7 +52,7 @@ A language-specific parser walks the directory, parses each file into a tree-sit
 | C# | `.cs` | methods, classes, interfaces, structs, enums, namespaces |
 | Java | `.java` | methods, classes, interfaces, enums |
 | Go | `.go` | functions, methods, structs, interfaces |
-| Rust | `.rs` | functions, structs, traits, enums, impl blocks |
+| Rust | `.rs` | functions, structs, traits, enums, impl blocks, `verus!` blocks |
 | Solidity | `.sol` | contracts, interfaces, libraries, functions, modifiers, structs, enums |
 | Cairo | `.cairo` | functions, traits, structs, enums, impl blocks, StarkNet contracts |
 | Circom | `.circom` | templates, functions, signals, components |
@@ -72,6 +72,34 @@ A language-specific parser walks the directory, parses each file into a tree-sit
 | Thrift | `.thrift` | services, functions, structs, fields, enums |
 | GraphQL | `.graphql`, `.gql` | object types, root operations, fields, enums |
 | SQL | `.sql` | schemas, tables, views, functions, procedures |
+
+The Rust parser extracts ordinary, `spec`, and `proof` functions with bodies
+from `verus! { ... }` blocks. The Verus grammar currently supports only
+brace-delimited blocks; `verus!(...)` and `verus![...]` are skipped with a warning.
+Inline modules retain qualified IDs (for example, `file.inner:function`), and
+methods retain their impl or trait owner. Each block is parsed independently;
+syntax errors produce a warning with the file and block location.
+Qualified invocations such as `vstd::prelude::verus!` are supported too.
+Local helper functions retain their enclosing function in their IDs (for example,
+`file:outer.inner`). Calls to these helpers and relative imports such as
+`use super::*` resolve to declarations present in the file.
+Repeated local names in different blocks receive a byte-offset suffix to keep
+their nodes distinct, and calls respect block scope.
+Local structs, enums, traits, and inline modules retain the enclosing function
+too: for example, `file:outer.Guard.drop` and `file:outer.local.helper`.
+Their bodies have separate calls and complexity. Explicit calls to known local
+types and modules resolve within the file. Bare calls search function and module
+scopes; associated items use paths such as `Type::method`. Dotted calls resolve
+only when the receiver names a known struct or enum. Other value receivers,
+including `self.method()`, remain unresolved. Implicit destructor calls and receiver
+type inference are not modeled. These rules apply to ordinary Rust as well as
+Verus blocks. Editing code before a declaration with an offset suffix changes
+its ID, so `trailmark diff` can report that declaration as removed and added.
+
+Trailmark does not expand arbitrary macros. Literal Verus invocations inside
+opaque macros or function bodies are skipped with a warning. Uninvoked
+`macro_rules!` definitions are not expanded. Function signatures without bodies
+and calls in `requires`/`ensures` clauses are not extracted.
 
 ```mermaid
 flowchart TD
@@ -270,6 +298,25 @@ offline environments, pre-populate the package cache with
 matching platform, then copy the resulting `tree-sitter-language-pack` cache
 directory to the target machine. `HTTPS_PROXY` is also honored. The SQL grammar
 ships as the `tree-sitter-sql` wheel dependency and does not use that cache.
+
+The bundled Circom, Miden Assembly, and Verus grammars compile on first use.
+This requires a C compiler (`cc`), Python development headers, and write access
+to their installed grammar directories. Rust files without Verus blocks do not
+trigger compilation. If the Verus grammar cannot be built or loaded, Trailmark
+logs a warning, skips Verus blocks, and continues parsing ordinary Rust.
+The Verus binding cache includes the compiled source contents, Python ABI,
+platform, and compiler options. Changed inputs select a new binding; completed
+builds are published atomically. Compiler failures include the exit status and
+stderr in the warning.
+
+Git checkouts keep the Verus grammar definition and generate its C parser during
+builds with Tree-sitter CLI 0.25.3. Before `uv sync` or `uv build` in a checkout,
+run `npm ci` with npm install scripts enabled; Node.js is needed for generation.
+The generated parser and headers are gitignored. Wheels and source distributions
+include these generated sources, so installing published packages needs neither
+Node.js nor the Tree-sitter CLI.
+Editable `uv` installs rerun the build hook to restore missing generated files;
+unchanged inputs reuse the existing output.
 
 ## Usage
 
@@ -522,6 +569,7 @@ consumers that exhaustively match enum values should add cases for them.
 
 ```bash
 # Install package and dev dependencies
+npm ci
 uv sync --all-groups
 
 # Lint and format
@@ -534,9 +582,38 @@ uv tool install ty && ty check
 # Tests
 uv run pytest -q tests/
 
-# Mutation testing (on macOS, set this env var to avoid rustworkx fork segfaults)
-OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES uv run mutmut run
+# Mutation testing with pytest-gremlins
+uv run python -m tests.run_mutations --reviewed --workers=4
+uv run python -m tests.mutation_gate
+
+# Full repository mutation campaign
+uv run python -m tests.run_mutations --workers=4
 ```
+
+Mutation reports are written to `coverage/gremlins/`. Pull requests mutate the
+Rust/Verus files named in `tests/mutation_baseline.json` and gate new and
+changed functions there. Full repository campaigns run on pushes to main
+and through the mutation workflow's manual trigger. Unchanged legacy functions
+are identified by source hashes and enter the gate automatically when edited.
+The gate rejects unreviewed survivors, missing tests/results, errors, and timeouts.
+Exceptions require a reason and a fingerprint of the function and mutation;
+changing that function requires reviewing its exceptions again.
+
+The runner pins pytest-gremlins 1.9.0 and uses real pytest subprocesses for every
+mutant, including fixtures and parametrized tests. Each mutant retains the full
+selected test suite: component unit tests run first, followed by the remaining
+tests, stopping at the first failure. Shared-helper mutants retain tests from
+every language. Tests stay in their existing files; `tests/mutation_order.py`
+defines the ordering, and unknown components retain collection order. The runner
+skips the redundant coverage pre-scan, checks the clean baseline and each distinct
+instrumented test ordering, and preserves package metadata and exact parameter
+IDs when loading mutated code.
+These compatibility measures address upstream runner and selection issues;
+their control tests must pass before upgrading the plugin.
+Snapshot updates (`TRAILMARK_UPDATE_SNAPSHOTS=1`) are disabled during CI and mutation
+runs. To focus a local campaign, pass `--targets` with comma-separated source
+paths, followed by the relevant test files. `--workers=4` already enables parallel
+execution. Use `--test-order=collection` to compare against pytest's original order.
 
 ## License
 

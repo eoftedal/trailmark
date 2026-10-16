@@ -2,6 +2,18 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.hooks.custom]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "src", "tests", "README.md", "LICENSE", "NOTICE", "pyproject.toml",
+    "hatch_build.py", "package.json", "package-lock.json",
+]
+
+[tool.uv]
+# Editable installs must restore generated files even when a wheel is cached.
+reinstall-package = ["trailmark"]
+
 [project]
 name = "trailmark"
 version = "0.5.0"
@@ -30,10 +42,11 @@ trailmark = "trailmark.cli:main"
 [dependency-groups]
 dev = [
     "hypothesis>=6.150.0",
-    "mutmut>=3.4.0",
+    "pytest-gremlins==1.9.0",
     "pytest>=9.0",
     "pytest-cov>=7.0.0",
     "ruff>=0.15.0,<1.0",
+    "pytest-timeout>=2.4,<3",
 ]
 
 [tool.ruff]
@@ -52,7 +65,4 @@ select = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
-[tool.mutmut]
-paths_to_mutate = ["src/trailmark/"]
-pytest_add_cli_args_test_selection = ["tests/"]
+markers = ["mutation_infrastructure: validate the runner once in its clean baseline"]

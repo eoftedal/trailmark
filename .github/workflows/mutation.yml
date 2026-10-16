@@ -5,16 +5,17 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: mutation-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
-  mutmut:
+  gremlins:
     name: Mutation Testing
     runs-on: ubuntu-latest
     steps:
@@ -28,11 +29,30 @@ jobs:
         with:
           python-version: "3.13"
 
-      - run: uv sync --all-groups
+      - run: npm ci
+      - run: uv sync --locked --all-groups
 
-      - name: Run mutation testing
-        run: uv run mutmut run
+      - name: Run reviewed mutation scope
+        if: github.event_name == 'pull_request'
+        run: uv run --locked python -m tests.run_mutations --reviewed --workers=4
 
-      - name: Show results
+      - name: Run full mutation campaign
+        if: github.event_name != 'pull_request'
+        run: uv run --locked python -m tests.run_mutations --workers=4
+
+      - name: Enforce reviewed Rust and Verus baseline
+        run: uv run --locked python -m tests.mutation_gate
+
+      - name: Record revision
         if: always()
-        run: uv run mutmut results
+        run: |
+          mkdir -p coverage/gremlins
+          git rev-parse HEAD > coverage/gremlins/revision.txt
+
+      - name: Upload mutation reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: mutation-report-${{ github.sha }}
+          path: coverage/gremlins/
+          if-no-files-found: error
